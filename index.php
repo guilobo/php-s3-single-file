@@ -10,6 +10,7 @@
  * - Delete empty bucket: DELETE /bucket
  * - List objects V2: GET /bucket?list-type=2
  * - Put object: PUT /bucket/key
+ * - Copy object: PUT /bucket/key with x-amz-copy-source
  * - Get object: GET /bucket/key
  * - Head object: HEAD /bucket/key
  * - Delete object: DELETE /bucket/key
@@ -21,7 +22,6 @@
  * - Object ACLs
  * - Bucket policies
  * - Versioning
- * - CopyObject
  * - Range requests
  * - Real S3 regions beyond signature compatibility
  *
@@ -168,6 +168,20 @@ function routeRequest(string $method, string $uriPath, array $query): void
 
     if (!isValidObjectKey($key)) {
         s3Error('InvalidObjectName', 'The specified key is not valid', 400);
+    }
+
+    if (isAclQuery($query)) {
+        if ($method === 'GET') {
+            getObjectAcl($bucket, $key);
+            exit;
+        }
+
+        if ($method === 'PUT') {
+            putObjectAcl($bucket, $key);
+            exit;
+        }
+
+        s3Error('MethodNotAllowed', 'Method not allowed for object ACL', 405);
     }
 
     if ($method === 'PUT') {
@@ -398,6 +412,14 @@ function listObjectsV2(string $bucket, array $query): void
 
 function putObject(string $bucket, string $key): void
 {
+    $headers = getHeadersLower();
+    $copySource = $headers['x-amz-copy-source'] ?? '';
+
+    if ($copySource !== '') {
+        copyObject($bucket, $key, $copySource);
+        return;
+    }
+
     $bucketPath = bucketPath($bucket);
 
     if (!is_dir($bucketPath)) {
@@ -463,6 +485,123 @@ function putObject(string $bucket, string $key): void
     header('ETag: "' . $etag . '"');
     header('Content-Length: 0');
 
+    exit;
+}
+
+function copyObject(string $destinationBucket, string $destinationKey, string $copySource): void
+{
+    ensureBucketExists($destinationBucket);
+
+    [$sourceBucket, $sourceKey] = parseCopySource($copySource);
+
+    if (!isValidBucketName($sourceBucket)) {
+        s3Error('InvalidBucketName', 'The specified bucket is not valid', 400);
+    }
+
+    if (!isValidObjectKey($sourceKey)) {
+        s3Error('InvalidArgument', 'Invalid copy source key', 400);
+    }
+
+    ensureBucketExists($sourceBucket);
+
+    $sourcePath = objectPath($sourceBucket, $sourceKey);
+
+    if (!is_file($sourcePath)) {
+        s3Error('NoSuchKey', 'The specified key does not exist', 404);
+    }
+
+    $destinationPath = objectPath($destinationBucket, $destinationKey);
+    $destinationDir = dirname($destinationPath);
+
+    if (!is_dir($destinationDir) && !mkdir($destinationDir, 0775, true)) {
+        s3Error('InternalError', 'Could not create object directory', 500);
+    }
+
+    if (!@copy($sourcePath, $destinationPath)) {
+        s3Error('InternalError', 'Could not copy object', 500);
+    }
+
+    $etag = md5_file($destinationPath);
+    $lastModified = gmdate('Y-m-d\TH:i:s.000\Z', filemtime($destinationPath) ?: time());
+
+    debugLog(
+        'COPY_OK src_bucket=' . $sourceBucket
+        . ' src_key=' . $sourceKey
+        . ' dst_bucket=' . $destinationBucket
+        . ' dst_key=' . $destinationKey
+        . ' etag=' . $etag
+    );
+
+    while (ob_get_level() > 0) {
+        ob_end_clean();
+    }
+
+    http_response_code(200);
+    header('Content-Type: application/xml');
+    header('ETag: "' . $etag . '"');
+
+    $body = xmlHeader()
+        . '<CopyObjectResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+        . '<LastModified>' . xmlEscape($lastModified) . '</LastModified>'
+        . '<ETag>"' . xmlEscape($etag) . '"</ETag>'
+        . '</CopyObjectResult>';
+
+    header('Content-Length: ' . strlen($body));
+    echo $body;
+    exit;
+}
+
+function getObjectAcl(string $bucket, string $key): void
+{
+    ensureBucketExists($bucket);
+
+    if (!is_file(objectPath($bucket, $key))) {
+        s3Error('NoSuchKey', 'The specified key does not exist', 404);
+    }
+
+    $body = xmlHeader()
+        . '<AccessControlPolicy xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+        . '<Owner>'
+        . '<ID>local</ID>'
+        . '<DisplayName>local</DisplayName>'
+        . '</Owner>'
+        . '<AccessControlList>'
+        . '<Grant>'
+        . '<Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="CanonicalUser">'
+        . '<ID>local</ID>'
+        . '<DisplayName>local</DisplayName>'
+        . '</Grantee>'
+        . '<Permission>FULL_CONTROL</Permission>'
+        . '</Grant>'
+        . '</AccessControlList>'
+        . '</AccessControlPolicy>';
+
+    while (ob_get_level() > 0) {
+        ob_end_clean();
+    }
+
+    http_response_code(200);
+    header('Content-Type: application/xml');
+    header('Content-Length: ' . strlen($body));
+
+    echo $body;
+    exit;
+}
+
+function putObjectAcl(string $bucket, string $key): void
+{
+    ensureBucketExists($bucket);
+
+    if (!is_file(objectPath($bucket, $key))) {
+        s3Error('NoSuchKey', 'The specified key does not exist', 404);
+    }
+
+    while (ob_get_level() > 0) {
+        ob_end_clean();
+    }
+
+    http_response_code(200);
+    header('Content-Length: 0');
     exit;
 }
 
@@ -792,6 +931,32 @@ function parseBucketAndKey(string $uriPath): array
     return [$bucket, $key];
 }
 
+function parseCopySource(string $copySource): array
+{
+    $copySource = trim($copySource);
+
+    if ($copySource === '') {
+        s3Error('InvalidArgument', 'Missing x-amz-copy-source header', 400);
+    }
+
+    $sourcePath = rawurldecode(parse_url($copySource, PHP_URL_PATH) ?: $copySource);
+    $sourcePath = trim($sourcePath, '/');
+
+    if ($sourcePath === '') {
+        s3Error('InvalidArgument', 'Invalid x-amz-copy-source header', 400);
+    }
+
+    $parts = explode('/', $sourcePath, 2);
+    $sourceBucket = $parts[0] ?? '';
+    $sourceKey = $parts[1] ?? '';
+
+    if ($sourceBucket === '' || $sourceKey === '') {
+        s3Error('InvalidArgument', 'Invalid x-amz-copy-source header', 400);
+    }
+
+    return [$sourceBucket, $sourceKey];
+}
+
 function envValue(string $name, string $default): string
 {
     $value = getenv($name);
@@ -872,6 +1037,11 @@ function normalizePath(string $path): string
     $prefix = str_starts_with($path, '/') ? '/' : '';
 
     return $prefix . implode('/', $parts);
+}
+
+function isAclQuery(array $query): bool
+{
+    return array_key_exists('acl', $query);
 }
 
 function isValidBucketName(string $bucket): bool

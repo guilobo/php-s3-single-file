@@ -15,6 +15,7 @@ $config = [
 
 $bucket = 'smoke-' . gmdate('Ymdhis') . '-' . substr(bin2hex(random_bytes(4)), 0, 8);
 $key = 'folder/hello.txt';
+$copiedKey = 'folder/copied.txt';
 $payload = "hello from smoke test\n";
 
 println('Endpoint: ' . $config['endpoint']);
@@ -37,13 +38,45 @@ $headObject = sendSignedRequest($config, 'HEAD', '/' . $bucket . '/' . $key);
 assertResponse($headObject, 200, 'head object');
 assertHeaderPresent($headObject, 'etag', 'head object returns ETag');
 
+$getObjectAcl = sendSignedRequest($config, 'GET', '/' . $bucket . '/' . $key, ['acl' => '']);
+assertResponse($getObjectAcl, 200, 'get object acl');
+assertContains($getObjectAcl['body'], '<AccessControlPolicy xmlns="http://s3.amazonaws.com/doc/2006-03-01/">', 'get object acl returns AccessControlPolicy');
+assertContains($getObjectAcl['body'], '<Permission>FULL_CONTROL</Permission>', 'get object acl returns owner permission');
+
+$putObjectAcl = sendSignedRequest($config, 'PUT', '/' . $bucket . '/' . $key, ['acl' => '']);
+assertResponse($putObjectAcl, 200, 'put object acl');
+
 $getObject = sendSignedRequest($config, 'GET', '/' . $bucket . '/' . $key);
 assertResponse($getObject, 200, 'download object');
 assertSameText($payload, $getObject['body'], 'downloaded payload matches');
 
+$copyObject = sendSignedRequest(
+    $config,
+    'PUT',
+    '/' . $bucket . '/' . $copiedKey,
+    [],
+    '',
+    'application/octet-stream',
+    ['x-amz-copy-source' => '/' . $bucket . '/' . $key]
+);
+assertResponse($copyObject, 200, 'copy object');
+assertContains($copyObject['body'], '<CopyObjectResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">', 'copy object returns CopyObjectResult');
+
+$headCopiedObject = sendSignedRequest($config, 'HEAD', '/' . $bucket . '/' . $copiedKey);
+assertResponse($headCopiedObject, 200, 'head copied object');
+assertHeaderPresent($headCopiedObject, 'content-length', 'copied object returns Content-Length');
+assertHeaderPresent($headCopiedObject, 'content-type', 'copied object returns Content-Type');
+assertHeaderPresent($headCopiedObject, 'etag', 'copied object returns ETag');
+assertHeaderPresent($headCopiedObject, 'last-modified', 'copied object returns Last-Modified');
+
+$getCopiedObject = sendSignedRequest($config, 'GET', '/' . $bucket . '/' . $copiedKey);
+assertResponse($getCopiedObject, 200, 'download copied object');
+assertSameText($payload, $getCopiedObject['body'], 'copied payload matches');
+
 $listObjects = sendSignedRequest($config, 'GET', '/' . $bucket, ['list-type' => '2']);
 assertResponse($listObjects, 200, 'list objects');
 assertContains($listObjects['body'], '<Key>folder/hello.txt</Key>', 'object appears in object list');
+assertContains($listObjects['body'], '<Key>folder/copied.txt</Key>', 'copied object appears in object list');
 
 $missingBucketObject = sendSignedRequest($config, 'GET', '/missing-bucket/' . $key);
 assertResponse($missingBucketObject, 404, 'missing bucket object request');
@@ -59,6 +92,7 @@ if ($config['expect_unsigned_get']) {
 $deleteNonEmptyBucket = sendSignedRequest($config, 'DELETE', '/' . $bucket);
 assertResponse($deleteNonEmptyBucket, 409, 'delete non-empty bucket');
 
+assertResponse(sendSignedRequest($config, 'DELETE', '/' . $bucket . '/' . $copiedKey), 204, 'delete copied object');
 assertResponse(sendSignedRequest($config, 'DELETE', '/' . $bucket . '/' . $key), 204, 'delete object');
 assertResponse(sendSignedRequest($config, 'DELETE', '/' . $bucket), 204, 'delete empty bucket');
 
@@ -71,7 +105,8 @@ function sendSignedRequest(
     string $path,
     array $query = [],
     string $body = '',
-    string $contentType = 'application/octet-stream'
+    string $contentType = 'application/octet-stream',
+    array $extraHeaders = []
 ): array {
     $endpoint = rtrim($config['endpoint'], '/');
     $url = $endpoint . $path;
@@ -100,6 +135,10 @@ function sendSignedRequest(
 
     if ($body !== '') {
         $headers['content-type'] = $contentType;
+    }
+
+    foreach ($extraHeaders as $headerName => $headerValue) {
+        $headers[strtolower($headerName)] = $headerValue;
     }
 
     $signedHeaderNames = array_keys($headers);
