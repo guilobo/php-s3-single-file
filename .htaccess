@@ -66,3 +66,12 @@ RewriteRule ^ index.php [QSA,L]
 RewriteCond %{REQUEST_FILENAME} -d
 RewriteCond %{REQUEST_URI} !^/storage [NC]
 RewriteRule ^ index.php [QSA,L]
+
+# BEGIN S3 single-file credentials
+# If you want to use credentials here, uncomment the lines below and set your values.
+#SetEnv S3_ACCESS_KEY your-access-key
+#SetEnv S3_SECRET_KEY your-secret-key
+#SetEnv S3_REGION us-east-1
+#SetEnv S3_SERVICE s3
+#SetEnv S3_REQUIRE_AUTH true
+# END S3 S3 single-file credentials
