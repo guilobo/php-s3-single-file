@@ -1,0 +1,68 @@
+Options -Indexes
+ServerSignature Off
+
+DirectoryIndex index.php
+
+RewriteEngine On
+
+# Make sure Authorization reaches PHP.
+SetEnvIf Authorization "(.*)" HTTP_AUTHORIZATION=$1
+
+RewriteCond %{HTTP:Authorization} ^(.+)
+RewriteRule .* - [E=HTTP_AUTHORIZATION:%1]
+
+# Block direct access to storage.
+RewriteRule ^storage(/.*)?$ - [F,L]
+
+# Block sensitive files.
+<FilesMatch "(^\.|\.env$|composer\.(json|lock)$|package(-lock)?\.json$|yarn\.lock$|phpunit\.xml$|README|readme|\.sql$|\.sqlite$|\.log$|\.bak$|\.backup$|\.old$|\.ini$|\.conf$)">
+    Require all denied
+</FilesMatch>
+
+# Block suspicious paths.
+RewriteCond %{THE_REQUEST} "\.\./" [NC,OR]
+RewriteCond %{REQUEST_URI} "%2e%2e" [NC,OR]
+RewriteCond %{REQUEST_URI} "\.git" [NC,OR]
+RewriteCond %{REQUEST_URI} "\.svn" [NC,OR]
+RewriteCond %{REQUEST_URI} "\.hg" [NC]
+RewriteRule ^ - [F,L]
+
+# Allow only the basic methods used by this S3-compatible endpoint.
+<LimitExcept GET HEAD PUT POST DELETE OPTIONS>
+    Require all denied
+</LimitExcept>
+
+# Route preflight requests through PHP.
+RewriteCond %{REQUEST_METHOD} OPTIONS
+RewriteRule ^ index.php [QSA,L]
+
+# Upload limit: 512 MB.
+LimitRequestBody 536870912
+
+<IfModule mod_headers.c>
+    Header always set X-Content-Type-Options "nosniff"
+    Header always set X-Frame-Options "DENY"
+    Header always set Referrer-Policy "no-referrer"
+    Header always set X-Robots-Tag "noindex, nofollow, noarchive"
+    Header always unset X-Powered-By
+
+    Header always set Access-Control-Allow-Origin "*"
+    Header always set Access-Control-Allow-Methods "GET, HEAD, PUT, DELETE, OPTIONS"
+    Header always set Access-Control-Allow-Headers "Authorization, Content-Type, Content-Length, Content-MD5, X-Amz-Date, X-Amz-Content-Sha256, X-Amz-Security-Token, X-Amz-Acl"
+    Header always set Access-Control-Expose-Headers "ETag, x-amz-request-id, x-amz-id-2"
+</IfModule>
+
+<IfModule mod_deflate.c>
+    SetEnv no-gzip 1
+</IfModule>
+
+# Send all S3 routes to index.php.
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule ^ index.php [QSA,L]
+
+# If a real directory is requested, still route it to index.php,
+# except for /storage, which is already blocked above.
+RewriteCond %{REQUEST_FILENAME} -d
+RewriteCond %{REQUEST_URI} !^/storage [NC]
+RewriteRule ^ index.php [QSA,L]

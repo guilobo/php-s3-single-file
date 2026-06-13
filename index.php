@@ -1,0 +1,1004 @@
+<?php
+/**
+ * Single-file S3-compatible storage API
+ *
+ * Supported:
+ * - AWS Signature Version 4 authentication
+ * - Path-style endpoint: /bucket/key
+ * - List all buckets: GET /
+ * - Create bucket: PUT /bucket
+ * - Delete empty bucket: DELETE /bucket
+ * - List objects V2: GET /bucket?list-type=2
+ * - Put object: PUT /bucket/key
+ * - Get object: GET /bucket/key
+ * - Head object: HEAD /bucket/key
+ * - Delete object: DELETE /bucket/key
+ * - Basic presigned URL support
+ *
+ * Not supported:
+ * - Multipart upload
+ * - Object ACLs
+ * - Bucket policies
+ * - Versioning
+ * - CopyObject
+ * - Range requests
+ * - Real S3 regions beyond signature compatibility
+ *
+ * Recommended Laravel config:
+ *
+ * 'my_s3' => [
+ *     'driver' => 's3',
+ *     'key' => env('MY_S3_KEY'),
+ *     'secret' => env('MY_S3_SECRET'),
+ *     'region' => 'us-east-1',
+ *     'bucket' => env('MY_S3_BUCKET'),
+ *     'endpoint' => env('MY_S3_ENDPOINT'),
+ *     'use_path_style_endpoint' => true,
+ *     'throw' => false,
+ * ],
+ */
+
+declare(strict_types=1);
+
+/*
+|--------------------------------------------------------------------------
+| Configuration
+|--------------------------------------------------------------------------
+*/
+
+define('S3_ACCESS_KEY', envValue('S3_ACCESS_KEY', 'change-me'));
+define('S3_SECRET_KEY', envValue('S3_SECRET_KEY', 'change-me'));
+define('S3_REGION', envValue('S3_REGION', 'us-east-1'));
+define('S3_SERVICE', envValue('S3_SERVICE', 's3'));
+
+define('STORAGE_ROOT', envValue('S3_STORAGE_ROOT', __DIR__ . '/storage'));
+define('MAX_UPLOAD_BYTES', (int)envValue('S3_MAX_UPLOAD_BYTES', '536870912')); // 512 MB
+
+define('REQUIRE_AUTH', envFlag('S3_REQUIRE_AUTH', true));
+define('ALLOW_UNSIGNED_GET', envFlag('S3_ALLOW_UNSIGNED_GET', false));
+
+define('SERVER_NAME', envValue('S3_SERVER_NAME', 'PHP Single File S3'));
+define('DEBUG_LOG_ENABLED', envFlag('S3_DEBUG_LOG_ENABLED', false));
+
+/*
+|--------------------------------------------------------------------------
+| Bootstrap
+|--------------------------------------------------------------------------
+*/
+
+date_default_timezone_set('UTC');
+
+function debugLog(string $message): void
+{
+    if (!defined('DEBUG_LOG_ENABLED') || !DEBUG_LOG_ENABLED) {
+        return;
+    }
+
+    @file_put_contents(
+        __DIR__ . '/s3-debug.log',
+        '[' . gmdate('Y-m-d H:i:s') . '] ' . $message . PHP_EOL,
+        FILE_APPEND
+    );
+}
+
+debugLog('METHOD=' . ($_SERVER['REQUEST_METHOD'] ?? ''));
+debugLog('URI=' . ($_SERVER['REQUEST_URI'] ?? ''));
+debugLog('QUERY=' . ($_SERVER['QUERY_STRING'] ?? ''));
+debugLog('CONTENT_LENGTH=' . ($_SERVER['CONTENT_LENGTH'] ?? ''));
+debugLog('HTTP_AUTHORIZATION=' . (isset($_SERVER['HTTP_AUTHORIZATION']) ? 'yes' : 'no'));
+debugLog('REDIRECT_HTTP_AUTHORIZATION=' . (isset($_SERVER['REDIRECT_HTTP_AUTHORIZATION']) ? 'yes' : 'no'));
+
+if (!is_dir(STORAGE_ROOT)) {
+    mkdir(STORAGE_ROOT, 0775, true);
+}
+
+$method = strtoupper($_SERVER['REQUEST_METHOD'] ?? 'GET');
+$uriPath = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
+$queryString = $_SERVER['QUERY_STRING'] ?? '';
+$query = [];
+parse_str($queryString, $query);
+
+sendCommonHeaders();
+
+try {
+    if ($method === 'OPTIONS') {
+        respondToOptions();
+    }
+
+    if (REQUIRE_AUTH && !(ALLOW_UNSIGNED_GET && in_array($method, ['GET', 'HEAD'], true))) {
+        authenticateRequest($method, $uriPath, $query);
+    }
+
+    routeRequest($method, $uriPath, $query);
+} catch (S3Error $e) {
+    s3Error($e->codeName, $e->message, $e->httpStatus);
+} catch (Throwable $e) {
+    s3Error('InternalError', 'Internal server error', 500);
+}
+
+/*
+|--------------------------------------------------------------------------
+| Router
+|--------------------------------------------------------------------------
+*/
+
+function routeRequest(string $method, string $uriPath, array $query): void
+{
+    [$bucket, $key] = parseBucketAndKey($uriPath);
+
+    debugLog('ROUTE method=' . $method . ' bucket=' . ($bucket ?? 'NULL') . ' key=' . $key);
+
+    if ($bucket === null) {
+        if ($method === 'GET') {
+            listBuckets();
+            exit;
+        }
+
+        s3Error('MethodNotAllowed', 'Method not allowed', 405);
+    }
+
+    if (!isValidBucketName($bucket)) {
+        s3Error('InvalidBucketName', 'The specified bucket is not valid', 400);
+    }
+
+    if ($key === '') {
+        if ($method === 'PUT') {
+            createBucket($bucket);
+            exit;
+        }
+
+        if ($method === 'DELETE') {
+            deleteBucket($bucket);
+            exit;
+        }
+
+        if ($method === 'GET') {
+            listObjectsV2($bucket, $query);
+            exit;
+        }
+
+        if ($method === 'HEAD') {
+            headBucket($bucket);
+            exit;
+        }
+
+        s3Error('MethodNotAllowed', 'Method not allowed for bucket root', 405);
+    }
+
+    if (!isValidObjectKey($key)) {
+        s3Error('InvalidObjectName', 'The specified key is not valid', 400);
+    }
+
+    if ($method === 'PUT' || $method === 'POST') {
+        putObject($bucket, $key);
+        exit;
+    }
+
+    if ($method === 'GET') {
+        getObject($bucket, $key, false);
+        exit;
+    }
+
+    if ($method === 'HEAD') {
+        getObject($bucket, $key, true);
+        exit;
+    }
+
+    if ($method === 'DELETE') {
+        deleteObject($bucket, $key);
+        exit;
+    }
+
+    s3Error('MethodNotAllowed', 'Method not allowed for object', 405);
+}
+
+/*
+|--------------------------------------------------------------------------
+| Bucket operations
+|--------------------------------------------------------------------------
+*/
+
+function listBuckets(): void
+{
+    $buckets = [];
+
+    foreach (glob(STORAGE_ROOT . '/*', GLOB_ONLYDIR) ?: [] as $dir) {
+        $name = basename($dir);
+
+        if (!isValidBucketName($name)) {
+            continue;
+        }
+
+        $buckets[] = [
+            'name' => $name,
+            'date' => gmdate('Y-m-d\TH:i:s.000\Z', filemtime($dir) ?: time()),
+        ];
+    }
+
+    header('Content-Type: application/xml');
+
+    echo xmlHeader();
+    echo '<ListAllMyBucketsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">';
+    echo '<Owner><ID>local</ID><DisplayName>local</DisplayName></Owner>';
+    echo '<Buckets>';
+
+    foreach ($buckets as $bucket) {
+        echo '<Bucket>';
+        echo '<Name>' . xmlEscape($bucket['name']) . '</Name>';
+        echo '<CreationDate>' . xmlEscape($bucket['date']) . '</CreationDate>';
+        echo '</Bucket>';
+    }
+
+    echo '</Buckets>';
+    echo '</ListAllMyBucketsResult>';
+}
+
+function createBucket(string $bucket): void
+{
+    $path = bucketPath($bucket);
+
+    if (is_dir($path)) {
+        s3Error('BucketAlreadyOwnedByYou', 'The bucket you tried to create already exists', 409);
+    }
+
+    if (!is_dir($path) && !mkdir($path, 0775, true)) {
+        s3Error('InternalError', 'Could not create bucket', 500);
+    }
+
+    http_response_code(200);
+    header('Location: /' . rawurlencode($bucket));
+    header('Content-Length: 0');
+    exit;
+}
+
+function deleteBucket(string $bucket): void
+{
+    $path = bucketPath($bucket);
+
+    if (!is_dir($path)) {
+        s3Error('NoSuchBucket', 'The specified bucket does not exist', 404);
+    }
+
+    $items = array_diff(scandir($path) ?: [], ['.', '..']);
+
+    if (count($items) > 0) {
+        s3Error('BucketNotEmpty', 'The bucket you tried to delete is not empty', 409);
+    }
+
+    if (!rmdir($path)) {
+        s3Error('InternalError', 'Could not delete bucket', 500);
+    }
+
+    http_response_code(204);
+}
+
+function headBucket(string $bucket): void
+{
+    if (!is_dir(bucketPath($bucket))) {
+        s3Error('NoSuchBucket', 'The specified bucket does not exist', 404);
+    }
+
+    http_response_code(200);
+    header('Content-Length: 0');
+    exit;
+}
+
+function listObjectsV2(string $bucket, array $query): void
+{
+    $bucketPath = bucketPath($bucket);
+
+    if (!is_dir($bucketPath)) {
+        s3Error('NoSuchBucket', 'The specified bucket does not exist', 404);
+    }
+
+    $prefix = rawurldecode((string)($query['prefix'] ?? ''));
+    $delimiter = rawurldecode((string)($query['delimiter'] ?? ''));
+    $maxKeys = max(1, min(1000, (int)($query['max-keys'] ?? 1000)));
+    $continuationToken = (string)($query['continuation-token'] ?? '');
+
+    if (!isValidObjectKey($prefix, true)) {
+        s3Error('InvalidArgument', 'Invalid prefix', 400);
+    }
+
+    $all = [];
+    $commonPrefixes = [];
+
+    $iterator = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($bucketPath, FilesystemIterator::SKIP_DOTS),
+        RecursiveIteratorIterator::LEAVES_ONLY
+    );
+
+    foreach ($iterator as $file) {
+        if (!$file->isFile()) {
+            continue;
+        }
+
+        $relative = str_replace('\\', '/', substr($file->getPathname(), strlen($bucketPath) + 1));
+
+        if ($prefix !== '' && !str_starts_with($relative, $prefix)) {
+            continue;
+        }
+
+        if ($delimiter !== '') {
+            $rest = substr($relative, strlen($prefix));
+            $pos = strpos($rest, $delimiter);
+
+            if ($pos !== false) {
+                $commonPrefixes[$prefix . substr($rest, 0, $pos + strlen($delimiter))] = true;
+                continue;
+            }
+        }
+
+        $all[] = $relative;
+    }
+
+    sort($all, SORT_STRING);
+    $commonPrefixKeys = array_keys($commonPrefixes);
+    sort($commonPrefixKeys, SORT_STRING);
+
+    $start = 0;
+
+    if ($continuationToken !== '') {
+        $decoded = base64_decode($continuationToken, true);
+        if ($decoded !== false && ctype_digit($decoded)) {
+            $start = (int)$decoded;
+        }
+    }
+
+    $slice = array_slice($all, $start, $maxKeys);
+    $nextIndex = $start + count($slice);
+    $isTruncated = $nextIndex < count($all);
+    $nextToken = $isTruncated ? base64_encode((string)$nextIndex) : '';
+
+    header('Content-Type: application/xml');
+
+    echo xmlHeader();
+    echo '<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">';
+    echo '<Name>' . xmlEscape($bucket) . '</Name>';
+    echo '<Prefix>' . xmlEscape($prefix) . '</Prefix>';
+    echo '<KeyCount>' . count($slice) . '</KeyCount>';
+    echo '<MaxKeys>' . $maxKeys . '</MaxKeys>';
+    echo '<IsTruncated>' . ($isTruncated ? 'true' : 'false') . '</IsTruncated>';
+
+    if ($continuationToken !== '') {
+        echo '<ContinuationToken>' . xmlEscape($continuationToken) . '</ContinuationToken>';
+    }
+
+    if ($nextToken !== '') {
+        echo '<NextContinuationToken>' . xmlEscape($nextToken) . '</NextContinuationToken>';
+    }
+
+    foreach ($slice as $key) {
+        $file = objectPath($bucket, $key);
+        echo '<Contents>';
+        if (($query['encoding-type'] ?? '') === 'url') {
+    echo '<Key>' . xmlEscape(rawurlencode($key)) . '</Key>';
+} else {
+    echo '<Key>' . xmlEscape($key) . '</Key>';
+}
+        echo '<LastModified>' . gmdate('Y-m-d\TH:i:s.000\Z', filemtime($file) ?: time()) . '</LastModified>';
+        echo '<ETag>"' . md5_file($file) . '"</ETag>';
+        echo '<Size>' . filesize($file) . '</Size>';
+        echo '<StorageClass>STANDARD</StorageClass>';
+        echo '</Contents>';
+    }
+
+    foreach ($commonPrefixKeys as $cp) {
+        echo '<CommonPrefixes><Prefix>' . xmlEscape($cp) . '</Prefix></CommonPrefixes>';
+    }
+
+    echo '</ListBucketResult>';
+}
+
+/*
+|--------------------------------------------------------------------------
+| Object operations
+|--------------------------------------------------------------------------
+*/
+
+function putObject(string $bucket, string $key): void
+{
+    $bucketPath = bucketPath($bucket);
+
+    if (!is_dir($bucketPath)) {
+        mkdir($bucketPath, 0775, true);
+    }
+
+    $contentLength = (int)($_SERVER['CONTENT_LENGTH'] ?? 0);
+
+    if ($contentLength > MAX_UPLOAD_BYTES) {
+        s3Error('EntityTooLarge', 'Your proposed upload exceeds the maximum allowed size', 400);
+    }
+
+    $filePath = objectPath($bucket, $key);
+    $dir = dirname($filePath);
+
+    if (!is_dir($dir) && !mkdir($dir, 0775, true)) {
+        s3Error('InternalError', 'Could not create object directory', 500);
+    }
+
+    $input = fopen('php://input', 'rb');
+    $output = fopen($filePath, 'wb');
+
+    if (!$input || !$output) {
+        s3Error('InternalError', 'Could not open file stream', 500);
+    }
+
+    $bytes = 0;
+
+    while (!feof($input)) {
+        $chunk = fread($input, 1024 * 1024);
+
+        if ($chunk === false) {
+            fclose($input);
+            fclose($output);
+            @unlink($filePath);
+            s3Error('InternalError', 'Could not read input stream', 500);
+        }
+
+        $bytes += strlen($chunk);
+
+        if ($bytes > MAX_UPLOAD_BYTES) {
+            fclose($input);
+            fclose($output);
+            @unlink($filePath);
+            s3Error('EntityTooLarge', 'Your proposed upload exceeds the maximum allowed size', 400);
+        }
+
+        fwrite($output, $chunk);
+    }
+
+    fclose($input);
+    fclose($output);
+
+    $etag = md5_file($filePath);
+
+    debugLog('PUT_OK bucket=' . $bucket . ' key=' . $key . ' bytes=' . $bytes . ' etag=' . $etag);
+
+    while (ob_get_level() > 0) {
+        ob_end_clean();
+    }
+
+    http_response_code(200);
+    header('ETag: "' . $etag . '"');
+    header('Content-Length: 0');
+
+    exit;
+}
+
+function getObject(string $bucket, string $key, bool $headOnly): void
+{
+    $filePath = objectPath($bucket, $key);
+
+    if (!is_file($filePath)) {
+        s3Error('NoSuchKey', 'The specified key does not exist', 404);
+    }
+
+    $mime = mime_content_type($filePath) ?: 'application/octet-stream';
+    $etag = md5_file($filePath);
+    $size = filesize($filePath);
+
+    http_response_code(200);
+    header('Content-Type: ' . $mime);
+    header('Content-Length: ' . $size);
+    header('ETag: "' . $etag . '"');
+    header('Last-Modified: ' . gmdate('D, d M Y H:i:s', filemtime($filePath) ?: time()) . ' GMT');
+    header('Accept-Ranges: none');
+
+    if (!$headOnly) {
+        readfile($filePath);
+    }
+}
+
+function deleteObject(string $bucket, string $key): void
+{
+    $filePath = objectPath($bucket, $key);
+
+    if (is_file($filePath)) {
+        unlink($filePath);
+        cleanupEmptyDirs(dirname($filePath), bucketPath($bucket));
+    }
+
+    http_response_code(204);
+}
+
+/*
+|--------------------------------------------------------------------------
+| AWS Signature Version 4
+|--------------------------------------------------------------------------
+*/
+
+function authenticateRequest(string $method, string $uriPath, array $query): void
+{
+    if (isset($query['X-Amz-Signature'])) {
+        authenticatePresignedUrl($method, $uriPath, $query);
+        return;
+    }
+
+    authenticateAuthorizationHeader($method, $uriPath, $query);
+}
+
+function authenticateAuthorizationHeader(string $method, string $uriPath, array $query): void
+{
+    $headers = getHeadersLower();
+    $authorization = $headers['authorization'] ?? '';
+
+    if ($authorization === '') {
+        s3Error('AccessDenied', 'Missing Authorization header', 403);
+    }
+
+    if (!str_starts_with($authorization, 'AWS4-HMAC-SHA256 ')) {
+        s3Error('InvalidRequest', 'Only AWS4-HMAC-SHA256 is supported', 400);
+    }
+
+    $authParts = parseAuthorizationHeader($authorization);
+
+    $credential = $authParts['Credential'] ?? '';
+    $signedHeaders = $authParts['SignedHeaders'] ?? '';
+    $providedSignature = $authParts['Signature'] ?? '';
+
+    if ($credential === '' || $signedHeaders === '' || $providedSignature === '') {
+        s3Error('AuthorizationHeaderMalformed', 'Invalid Authorization header', 400);
+    }
+
+    $credentialParts = explode('/', $credential);
+
+    if (count($credentialParts) !== 5) {
+        s3Error('AuthorizationHeaderMalformed', 'Invalid credential scope', 400);
+    }
+
+    [$accessKey, $date, $region, $service, $terminal] = $credentialParts;
+
+    if ($accessKey !== S3_ACCESS_KEY) {
+        s3Error('InvalidAccessKeyId', 'The AWS Access Key Id you provided does not exist in our records', 403);
+    }
+
+    if ($region !== S3_REGION || $service !== S3_SERVICE || $terminal !== 'aws4_request') {
+        s3Error('AuthorizationHeaderMalformed', 'Invalid credential scope', 400);
+    }
+
+    $amzDate = $headers['x-amz-date'] ?? '';
+
+    if ($amzDate === '') {
+        s3Error('AccessDenied', 'Missing x-amz-date header', 403);
+    }
+
+    $payloadHash = $headers['x-amz-content-sha256'] ?? hashPayloadFromInput();
+
+    $canonicalRequest = buildCanonicalRequest(
+        $method,
+        $uriPath,
+        $query,
+        $headers,
+        explode(';', $signedHeaders),
+        $payloadHash
+    );
+
+    $scope = $date . '/' . $region . '/' . $service . '/aws4_request';
+    $stringToSign = "AWS4-HMAC-SHA256\n" . $amzDate . "\n" . $scope . "\n" . hash('sha256', $canonicalRequest);
+    $signingKey = getSignatureKey(S3_SECRET_KEY, $date, $region, $service);
+    $calculatedSignature = hash_hmac('sha256', $stringToSign, $signingKey);
+
+    if (!hash_equals($calculatedSignature, $providedSignature)) {
+        s3Error('SignatureDoesNotMatch', 'The request signature we calculated does not match the signature you provided', 403);
+    }
+}
+
+function authenticatePresignedUrl(string $method, string $uriPath, array $query): void
+{
+    $headers = getHeadersLower();
+
+    $algorithm = (string)($query['X-Amz-Algorithm'] ?? '');
+    $credential = (string)($query['X-Amz-Credential'] ?? '');
+    $amzDate = (string)($query['X-Amz-Date'] ?? '');
+    $expires = (int)($query['X-Amz-Expires'] ?? 0);
+    $signedHeaders = (string)($query['X-Amz-SignedHeaders'] ?? '');
+    $providedSignature = (string)($query['X-Amz-Signature'] ?? '');
+
+    if ($algorithm !== 'AWS4-HMAC-SHA256') {
+        s3Error('InvalidRequest', 'Only AWS4-HMAC-SHA256 is supported', 400);
+    }
+
+    if ($credential === '' || $amzDate === '' || $expires <= 0 || $signedHeaders === '' || $providedSignature === '') {
+        s3Error('AccessDenied', 'Invalid presigned URL', 403);
+    }
+
+    $requestTime = DateTimeImmutable::createFromFormat('Ymd\THis\Z', $amzDate, new DateTimeZone('UTC'));
+
+    if (!$requestTime) {
+        s3Error('AccessDenied', 'Invalid X-Amz-Date', 403);
+    }
+
+    if (time() > ($requestTime->getTimestamp() + $expires)) {
+        s3Error('AccessDenied', 'Request has expired', 403);
+    }
+
+    $credentialParts = explode('/', rawurldecode($credential));
+
+    if (count($credentialParts) !== 5) {
+        s3Error('AuthorizationHeaderMalformed', 'Invalid credential scope', 400);
+    }
+
+    [$accessKey, $date, $region, $service, $terminal] = $credentialParts;
+
+    if ($accessKey !== S3_ACCESS_KEY) {
+        s3Error('InvalidAccessKeyId', 'Invalid access key', 403);
+    }
+
+    if ($region !== S3_REGION || $service !== S3_SERVICE || $terminal !== 'aws4_request') {
+        s3Error('AuthorizationHeaderMalformed', 'Invalid credential scope', 400);
+    }
+
+    $queryForCanonical = $query;
+    unset($queryForCanonical['X-Amz-Signature']);
+
+    $payloadHash = 'UNSIGNED-PAYLOAD';
+
+    if (!isset($headers['host'])) {
+        $headers['host'] = $_SERVER['HTTP_HOST'] ?? 'localhost';
+    }
+
+    $canonicalRequest = buildCanonicalRequest(
+        $method,
+        $uriPath,
+        $queryForCanonical,
+        $headers,
+        explode(';', $signedHeaders),
+        $payloadHash
+    );
+
+    $scope = $date . '/' . $region . '/' . $service . '/aws4_request';
+    $stringToSign = "AWS4-HMAC-SHA256\n" . $amzDate . "\n" . $scope . "\n" . hash('sha256', $canonicalRequest);
+    $signingKey = getSignatureKey(S3_SECRET_KEY, $date, $region, $service);
+    $calculatedSignature = hash_hmac('sha256', $stringToSign, $signingKey);
+
+    if (!hash_equals($calculatedSignature, $providedSignature)) {
+        s3Error('SignatureDoesNotMatch', 'The request signature we calculated does not match the signature you provided', 403);
+    }
+}
+
+function parseAuthorizationHeader(string $authorization): array
+{
+    $authorization = substr($authorization, strlen('AWS4-HMAC-SHA256 '));
+    $parts = array_map('trim', explode(',', $authorization));
+    $result = [];
+
+    foreach ($parts as $part) {
+        [$key, $value] = array_pad(explode('=', $part, 2), 2, '');
+        $result[$key] = $value;
+    }
+
+    return $result;
+}
+
+function buildCanonicalRequest(
+    string $method,
+    string $uriPath,
+    array $query,
+    array $headers,
+    array $signedHeaders,
+    string $payloadHash
+): string {
+    $signedHeaders = array_values(array_filter(array_map('strtolower', array_map('trim', $signedHeaders))));
+    sort($signedHeaders, SORT_STRING);
+
+    $canonicalHeaders = '';
+
+    foreach ($signedHeaders as $headerName) {
+        if (!array_key_exists($headerName, $headers)) {
+            s3Error('AccessDenied', 'Signed header missing: ' . $headerName, 403);
+        }
+
+        $canonicalHeaders .= $headerName . ':' . normalizeHeaderValue($headers[$headerName]) . "\n";
+    }
+
+    $canonicalSignedHeaders = implode(';', $signedHeaders);
+
+    return implode("\n", [
+        strtoupper($method),
+        canonicalUri($uriPath),
+        canonicalQueryString($query),
+        $canonicalHeaders,
+        $canonicalSignedHeaders,
+        $payloadHash,
+    ]);
+}
+
+function canonicalUri(string $path): string
+{
+    $path = parse_url($path, PHP_URL_PATH) ?: '/';
+
+    if ($path === '') {
+        return '/';
+    }
+
+    $segments = explode('/', $path);
+    $encoded = array_map(static fn($segment) => awsPercentEncode(rawurldecode($segment)), $segments);
+
+    $result = implode('/', $encoded);
+
+    return str_starts_with($result, '/') ? $result : '/' . $result;
+}
+
+function canonicalQueryString(array $query): string
+{
+    $pairs = [];
+
+    foreach ($query as $key => $value) {
+        if (is_array($value)) {
+            foreach ($value as $v) {
+                $pairs[] = [awsPercentEncode((string)$key), awsPercentEncode((string)$v)];
+            }
+        } else {
+            $pairs[] = [awsPercentEncode((string)$key), awsPercentEncode((string)$value)];
+        }
+    }
+
+    usort($pairs, static function ($a, $b) {
+        return $a[0] === $b[0] ? strcmp($a[1], $b[1]) : strcmp($a[0], $b[0]);
+    });
+
+    return implode('&', array_map(static fn($p) => $p[0] . '=' . $p[1], $pairs));
+}
+
+function awsPercentEncode(string $value): string
+{
+    return str_replace('%7E', '~', rawurlencode($value));
+}
+
+function normalizeHeaderValue(string $value): string
+{
+    return trim(preg_replace('/\s+/', ' ', $value) ?? '');
+}
+
+function getSignatureKey(string $key, string $dateStamp, string $regionName, string $serviceName): string
+{
+    $kDate = hash_hmac('sha256', $dateStamp, 'AWS4' . $key, true);
+    $kRegion = hash_hmac('sha256', $regionName, $kDate, true);
+    $kService = hash_hmac('sha256', $serviceName, $kRegion, true);
+
+    return hash_hmac('sha256', 'aws4_request', $kService, true);
+}
+
+function hashPayloadFromInput(): string
+{
+    return 'UNSIGNED-PAYLOAD';
+}
+
+/*
+|--------------------------------------------------------------------------
+| Helpers
+|--------------------------------------------------------------------------
+*/
+
+function parseBucketAndKey(string $uriPath): array
+{
+    $path = trim($uriPath, '/');
+
+    if ($path === '') {
+        return [null, ''];
+    }
+
+    $parts = explode('/', $path, 2);
+    $bucket = rawurldecode($parts[0]);
+    $key = isset($parts[1]) ? rawurldecode($parts[1]) : '';
+
+    return [$bucket, $key];
+}
+
+function envValue(string $name, string $default): string
+{
+    $value = getenv($name);
+
+    if ($value === false || $value === '') {
+        return $default;
+    }
+
+    return $value;
+}
+
+function envFlag(string $name, bool $default): bool
+{
+    $value = getenv($name);
+
+    if ($value === false || $value === '') {
+        return $default;
+    }
+
+    $normalized = strtolower(trim($value));
+
+    return in_array($normalized, ['1', 'true', 'yes', 'on'], true);
+}
+
+function bucketPath(string $bucket): string
+{
+    return STORAGE_ROOT . '/' . $bucket;
+}
+
+function objectPath(string $bucket, string $key): string
+{
+    $base = realpath(STORAGE_ROOT) ?: STORAGE_ROOT;
+    $path = bucketPath($bucket) . '/' . $key;
+
+    $normalized = normalizePath($path);
+
+    if (!str_starts_with($normalized, normalizePath($base . '/'))) {
+        s3Error('AccessDenied', 'Invalid object path', 403);
+    }
+
+    return $normalized;
+}
+
+function normalizePath(string $path): string
+{
+    $path = str_replace('\\', '/', $path);
+    $parts = [];
+
+    foreach (explode('/', $path) as $part) {
+        if ($part === '' || $part === '.') {
+            continue;
+        }
+
+        if ($part === '..') {
+            array_pop($parts);
+            continue;
+        }
+
+        $parts[] = $part;
+    }
+
+    $prefix = str_starts_with($path, '/') ? '/' : '';
+
+    return $prefix . implode('/', $parts);
+}
+
+function isValidBucketName(string $bucket): bool
+{
+    return (bool)preg_match('/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/', $bucket)
+        && !str_contains($bucket, '..')
+        && !preg_match('/^\d+\.\d+\.\d+\.\d+$/', $bucket);
+}
+
+function isValidObjectKey(string $key, bool $allowEmpty = false): bool
+{
+    if ($allowEmpty && $key === '') {
+        return true;
+    }
+
+    if ($key === '' || strlen($key) > 1024) {
+        return false;
+    }
+
+    if (str_contains($key, "\0") || str_contains($key, '../') || str_starts_with($key, '../')) {
+        return false;
+    }
+
+    return true;
+}
+
+function cleanupEmptyDirs(string $dir, string $stopAt): void
+{
+    $dir = normalizePath($dir);
+    $stopAt = normalizePath($stopAt);
+
+    while ($dir !== $stopAt && str_starts_with($dir, $stopAt)) {
+        $items = array_diff(scandir($dir) ?: [], ['.', '..']);
+
+        if (count($items) > 0) {
+            break;
+        }
+
+        @rmdir($dir);
+        $dir = dirname($dir);
+    }
+}
+
+function getHeadersLower(): array
+{
+    $headers = [];
+
+    foreach ($_SERVER as $key => $value) {
+        if (str_starts_with($key, 'HTTP_')) {
+            $name = strtolower(str_replace('_', '-', substr($key, 5)));
+            $headers[$name] = (string)$value;
+        }
+    }
+
+    if (isset($_SERVER['REDIRECT_HTTP_AUTHORIZATION']) && !isset($headers['authorization'])) {
+        $headers['authorization'] = (string)$_SERVER['REDIRECT_HTTP_AUTHORIZATION'];
+    }
+
+    if (isset($_SERVER['HTTP_AUTHORIZATION']) && !isset($headers['authorization'])) {
+        $headers['authorization'] = (string)$_SERVER['HTTP_AUTHORIZATION'];
+    }
+
+    if (isset($_SERVER['Authorization']) && !isset($headers['authorization'])) {
+        $headers['authorization'] = (string)$_SERVER['Authorization'];
+    }
+
+    if (function_exists('apache_request_headers')) {
+        foreach (apache_request_headers() as $name => $value) {
+            $headers[strtolower($name)] = (string)$value;
+        }
+    }
+
+    if (isset($_SERVER['CONTENT_TYPE'])) {
+        $headers['content-type'] = (string)$_SERVER['CONTENT_TYPE'];
+    }
+
+    if (isset($_SERVER['CONTENT_LENGTH'])) {
+        $headers['content-length'] = (string)$_SERVER['CONTENT_LENGTH'];
+    }
+
+    if (!isset($headers['host'])) {
+        $headers['host'] = $_SERVER['HTTP_HOST'] ?? 'localhost';
+    }
+
+    return $headers;
+}
+
+function sendCommonHeaders(): void
+{
+    header('Server: ' . SERVER_NAME);
+    header('x-amz-request-id: ' . bin2hex(random_bytes(8)));
+    header('x-amz-id-2: ' . bin2hex(random_bytes(16)));
+}
+
+function respondToOptions(): void
+{
+    http_response_code(204);
+    header('Content-Length: 0');
+    exit;
+}
+
+function xmlHeader(): string
+{
+    return '<?xml version="1.0" encoding="UTF-8"?>';
+}
+
+function xmlEscape(string $value): string
+{
+    return htmlspecialchars($value, ENT_XML1 | ENT_QUOTES, 'UTF-8');
+}
+
+function s3Error(string $code, string $message, int $status): void
+{
+    debugLog('ERROR status=' . $status . ' code=' . $code . ' message=' . $message);
+
+    $requestId = bin2hex(random_bytes(8));
+
+    $body = xmlHeader()
+        . '<Error>'
+        . '<Code>' . xmlEscape($code) . '</Code>'
+        . '<Message>' . xmlEscape($message) . '</Message>'
+        . '<RequestId>' . $requestId . '</RequestId>'
+        . '</Error>';
+
+    while (ob_get_level() > 0) {
+        ob_end_clean();
+    }
+
+    header_remove('Content-Length');
+    header_remove('Content-Type');
+
+    http_response_code($status);
+    header('Content-Type: application/xml');
+    header('Content-Length: ' . strlen($body));
+
+    echo $body;
+
+    exit;
+}
+
+class S3Error extends Exception
+{
+    public string $codeName;
+    public int $httpStatus;
+
+    public function __construct(string $codeName, string $message, int $httpStatus)
+    {
+        parent::__construct($message);
+        $this->codeName = $codeName;
+        $this->httpStatus = $httpStatus;
+    }
+}
