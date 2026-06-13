@@ -13,6 +13,7 @@
  * - Get object: GET /bucket/key
  * - Head object: HEAD /bucket/key
  * - Delete object: DELETE /bucket/key
+ * - CORS preflight: OPTIONS
  * - Basic presigned URL support
  *
  * Not supported:
@@ -169,7 +170,7 @@ function routeRequest(string $method, string $uriPath, array $query): void
         s3Error('InvalidObjectName', 'The specified key is not valid', 400);
     }
 
-    if ($method === 'PUT' || $method === 'POST') {
+    if ($method === 'PUT') {
         putObject($bucket, $key);
         exit;
     }
@@ -246,7 +247,6 @@ function createBucket(string $bucket): void
     }
 
     http_response_code(200);
-    header('Location: /' . rawurlencode($bucket));
     header('Content-Length: 0');
     exit;
 }
@@ -401,7 +401,7 @@ function putObject(string $bucket, string $key): void
     $bucketPath = bucketPath($bucket);
 
     if (!is_dir($bucketPath)) {
-        mkdir($bucketPath, 0775, true);
+        s3Error('NoSuchBucket', 'The specified bucket does not exist', 404);
     }
 
     $contentLength = (int)($_SERVER['CONTENT_LENGTH'] ?? 0);
@@ -468,6 +468,8 @@ function putObject(string $bucket, string $key): void
 
 function getObject(string $bucket, string $key, bool $headOnly): void
 {
+    ensureBucketExists($bucket);
+
     $filePath = objectPath($bucket, $key);
 
     if (!is_file($filePath)) {
@@ -492,6 +494,8 @@ function getObject(string $bucket, string $key, bool $headOnly): void
 
 function deleteObject(string $bucket, string $key): void
 {
+    ensureBucketExists($bucket);
+
     $filePath = objectPath($bucket, $key);
 
     if (is_file($filePath)) {
@@ -562,6 +566,8 @@ function authenticateAuthorizationHeader(string $method, string $uriPath, array 
     if ($amzDate === '') {
         s3Error('AccessDenied', 'Missing x-amz-date header', 403);
     }
+
+    validateAmzDate($amzDate);
 
     $payloadHash = $headers['x-amz-content-sha256'] ?? hashPayloadFromInput();
 
@@ -810,6 +816,22 @@ function envFlag(string $name, bool $default): bool
     return in_array($normalized, ['1', 'true', 'yes', 'on'], true);
 }
 
+function ensureBucketExists(string $bucket): void
+{
+    if (!is_dir(bucketPath($bucket))) {
+        s3Error('NoSuchBucket', 'The specified bucket does not exist', 404);
+    }
+}
+
+function validateAmzDate(string $amzDate): void
+{
+    $date = DateTimeImmutable::createFromFormat('Ymd\THis\Z', $amzDate, new DateTimeZone('UTC'));
+
+    if (!$date || $date->format('Ymd\THis\Z') !== $amzDate) {
+        s3Error('AccessDenied', 'Invalid x-amz-date header', 403);
+    }
+}
+
 function bucketPath(string $bucket): string
 {
     return STORAGE_ROOT . '/' . $bucket;
@@ -940,6 +962,7 @@ function getHeadersLower(): array
 function sendCommonHeaders(): void
 {
     header('Server: ' . SERVER_NAME);
+    header('Allow: GET, HEAD, PUT, DELETE, OPTIONS');
     header('x-amz-request-id: ' . bin2hex(random_bytes(8)));
     header('x-amz-id-2: ' . bin2hex(random_bytes(16)));
 }
@@ -966,12 +989,15 @@ function s3Error(string $code, string $message, int $status): void
     debugLog('ERROR status=' . $status . ' code=' . $code . ' message=' . $message);
 
     $requestId = bin2hex(random_bytes(8));
+    $resource = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
 
     $body = xmlHeader()
         . '<Error>'
         . '<Code>' . xmlEscape($code) . '</Code>'
         . '<Message>' . xmlEscape($message) . '</Message>'
+        . '<Resource>' . xmlEscape($resource) . '</Resource>'
         . '<RequestId>' . $requestId . '</RequestId>'
+        . '<HostId>' . bin2hex(random_bytes(16)) . '</HostId>'
         . '</Error>';
 
     while (ob_get_level() > 0) {

@@ -28,7 +28,7 @@ RewriteCond %{REQUEST_URI} "\.hg" [NC]
 RewriteRule ^ - [F,L]
 
 # Allow only the basic methods used by this S3-compatible endpoint.
-<LimitExcept GET HEAD PUT POST DELETE OPTIONS>
+<LimitExcept GET HEAD PUT DELETE OPTIONS>
     Require all denied
 </LimitExcept>
 

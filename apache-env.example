@@ -1,0 +1,13 @@
+# Example Apache environment variables for this project.
+# You can place these in your vhost config, Apache include, or hosting control panel.
+
+SetEnv S3_ACCESS_KEY your-access-key
+SetEnv S3_SECRET_KEY your-secret-key
+SetEnv S3_REGION us-east-1
+SetEnv S3_SERVICE s3
+SetEnv S3_STORAGE_ROOT /absolute/path/to/storage
+SetEnv S3_MAX_UPLOAD_BYTES 536870912
+SetEnv S3_REQUIRE_AUTH true
+SetEnv S3_ALLOW_UNSIGNED_GET false
+SetEnv S3_SERVER_NAME "PHP Single File S3"
+SetEnv S3_DEBUG_LOG_ENABLED false
