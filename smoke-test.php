@@ -78,6 +78,70 @@ assertResponse($listObjects, 200, 'list objects');
 assertContains($listObjects['body'], '<Key>folder/hello.txt</Key>', 'object appears in object list');
 assertContains($listObjects['body'], '<Key>folder/copied.txt</Key>', 'copied object appears in object list');
 
+$multipartKey = 'multipart/binary.bin';
+$multipartPayload1 = "Part one data for multipart test\n";
+$multipartPayload2 = "Part two data for multipart test\n";
+
+$initiateResponse = sendSignedRequest($config, 'POST', '/' . $bucket . '/' . $multipartKey, ['uploads' => ''], '', 'application/octet-stream');
+assertResponse($initiateResponse, 200, 'initiate multipart upload');
+assertContains($initiateResponse['body'], '<UploadId>', 'initiate returns UploadId');
+preg_match('/<UploadId>([^<]+)<\/UploadId>/', $initiateResponse['body'], $uploadIdMatches);
+$uploadId = $uploadIdMatches[1] ?? '';
+
+if ($uploadId === '') {
+    fail('could not extract UploadId from initiate multipart response');
+} else {
+    println('[ok] extracted UploadId from initiate response');
+}
+
+$uploadPart1 = sendSignedRequest($config, 'PUT', '/' . $bucket . '/' . $multipartKey, ['partNumber' => '1', 'uploadId' => $uploadId], $multipartPayload1, 'application/octet-stream');
+assertResponse($uploadPart1, 200, 'upload part 1');
+assertHeaderPresent($uploadPart1, 'etag', 'upload part 1 returns ETag');
+$etag1 = trim($uploadPart1['headers']['etag'] ?? '', '" ');
+
+$uploadPart2 = sendSignedRequest($config, 'PUT', '/' . $bucket . '/' . $multipartKey, ['partNumber' => '2', 'uploadId' => $uploadId], $multipartPayload2, 'application/octet-stream');
+assertResponse($uploadPart2, 200, 'upload part 2');
+$etag2 = trim($uploadPart2['headers']['etag'] ?? '', '" ');
+
+$listPartsResp = sendSignedRequest($config, 'GET', '/' . $bucket . '/' . $multipartKey, ['uploadId' => $uploadId]);
+assertResponse($listPartsResp, 200, 'list parts');
+assertContains($listPartsResp['body'], '<PartNumber>1</PartNumber>', 'list parts includes part 1');
+assertContains($listPartsResp['body'], '<PartNumber>2</PartNumber>', 'list parts includes part 2');
+
+$completeBody = '<CompleteMultipartUpload>'
+    . '<Part><PartNumber>1</PartNumber><ETag>"' . $etag1 . '"</ETag></Part>'
+    . '<Part><PartNumber>2</PartNumber><ETag>"' . $etag2 . '"</ETag></Part>'
+    . '</CompleteMultipartUpload>';
+
+$completeResp = sendSignedRequest($config, 'POST', '/' . $bucket . '/' . $multipartKey, ['uploadId' => $uploadId], $completeBody, 'application/xml');
+assertResponse($completeResp, 200, 'complete multipart upload');
+assertContains($completeResp['body'], '<CompleteMultipartUploadResult', 'complete returns result');
+
+$getMultipart = sendSignedRequest($config, 'GET', '/' . $bucket . '/' . $multipartKey);
+assertResponse($getMultipart, 200, 'download multipart object');
+assertSameText($multipartPayload1 . $multipartPayload2, $getMultipart['body'], 'multipart object payload matches');
+
+$abortKey = 'multipart/abort-test.bin';
+$abortInit = sendSignedRequest($config, 'POST', '/' . $bucket . '/' . $abortKey, ['uploads' => ''], '', 'application/octet-stream');
+assertResponse($abortInit, 200, 'initiate multipart abort test');
+preg_match('/<UploadId>([^<]+)<\/UploadId>/', $abortInit['body'], $abortIdMatches);
+$abortUploadId = $abortIdMatches[1] ?? '';
+
+if ($abortUploadId === '') {
+    fail('could not extract UploadId from abort initiate response');
+} else {
+    println('[ok] extracted UploadId for abort test');
+}
+
+$abortPartResp = sendSignedRequest($config, 'PUT', '/' . $bucket . '/' . $abortKey, ['partNumber' => '1', 'uploadId' => $abortUploadId], 'some data', 'application/octet-stream');
+assertResponse($abortPartResp, 200, 'upload part for abort test');
+
+$abortResp = sendSignedRequest($config, 'DELETE', '/' . $bucket . '/' . $abortKey, ['uploadId' => $abortUploadId], '', 'application/octet-stream');
+assertResponse($abortResp, 204, 'abort multipart upload');
+
+$abortListResp = sendSignedRequest($config, 'GET', '/' . $bucket . '/' . $abortKey, ['uploadId' => $abortUploadId]);
+assertResponse($abortListResp, 404, 'aborted upload not found');
+
 $missingBucketObject = sendSignedRequest($config, 'GET', '/missing-bucket/' . $key);
 assertResponse($missingBucketObject, 404, 'missing bucket object request');
 assertContains($missingBucketObject['body'], '<Code>NoSuchBucket</Code>', 'missing bucket returns NoSuchBucket');
@@ -92,6 +156,7 @@ if ($config['expect_unsigned_get']) {
 $deleteNonEmptyBucket = sendSignedRequest($config, 'DELETE', '/' . $bucket);
 assertResponse($deleteNonEmptyBucket, 409, 'delete non-empty bucket');
 
+assertResponse(sendSignedRequest($config, 'DELETE', '/' . $bucket . '/' . $multipartKey), 204, 'delete multipart object');
 assertResponse(sendSignedRequest($config, 'DELETE', '/' . $bucket . '/' . $copiedKey), 204, 'delete copied object');
 assertResponse(sendSignedRequest($config, 'DELETE', '/' . $bucket . '/' . $key), 204, 'delete object');
 assertResponse(sendSignedRequest($config, 'DELETE', '/' . $bucket), 204, 'delete empty bucket');

@@ -16,14 +16,19 @@
  * - Delete object: DELETE /bucket/key
  * - CORS preflight: OPTIONS
  * - Basic presigned URL support
+ * - Multipart upload: POST /bucket/key?uploads (initiate)
+ * - Upload part: PUT /bucket/key?partNumber=N&uploadId=X
+ * - Complete multipart: POST /bucket/key?uploadId=X
+ * - Abort multipart: DELETE /bucket/key?uploadId=X
+ * - List parts: GET /bucket/key?uploadId=X
  *
  * Not supported:
- * - Multipart upload
- * - Object ACLs
+ * - Object ACLs (stub only)
  * - Bucket policies
  * - Versioning
  * - Range requests
  * - Real S3 regions beyond signature compatibility
+ * - Multipart copy
  *
  * Recommended Laravel config:
  *
@@ -182,6 +187,43 @@ function routeRequest(string $method, string $uriPath, array $query): void
         }
 
         s3Error('MethodNotAllowed', 'Method not allowed for object ACL', 405);
+    }
+
+    if (isMultipartInitiateQuery($query)) {
+        if ($method === 'POST') {
+            createMultipartUpload($bucket, $key);
+            exit;
+        }
+
+        s3Error('MethodNotAllowed', 'Method not allowed for multipart initiate', 405);
+    }
+
+    if (isMultipartUploadPartQuery($query)) {
+        if ($method === 'PUT') {
+            uploadPart($bucket, $key, $query['uploadId'], (int)$query['partNumber']);
+            exit;
+        }
+
+        s3Error('MethodNotAllowed', 'Method not allowed for multipart upload part', 405);
+    }
+
+    if (isMultipartManagementQuery($query)) {
+        if ($method === 'POST') {
+            completeMultipartUpload($bucket, $key, $query['uploadId']);
+            exit;
+        }
+
+        if ($method === 'DELETE') {
+            abortMultipartUpload($bucket, $key, $query['uploadId']);
+            exit;
+        }
+
+        if ($method === 'GET') {
+            listParts($bucket, $key, $query['uploadId'], $query);
+            exit;
+        }
+
+        s3Error('MethodNotAllowed', 'Method not allowed for multipart management', 405);
     }
 
     if ($method === 'PUT') {
@@ -426,7 +468,14 @@ function putObject(string $bucket, string $key): void
         s3Error('NoSuchBucket', 'The specified bucket does not exist', 404);
     }
 
-    $contentLength = (int)($_SERVER['CONTENT_LENGTH'] ?? 0);
+    $contentEncoding = $headers['content-encoding'] ?? '';
+    $isAwsChunked = str_contains($contentEncoding, 'aws-chunked');
+
+    if ($isAwsChunked) {
+        $contentLength = (int)($headers['x-amz-decoded-content-length'] ?? 0);
+    } else {
+        $contentLength = (int)($_SERVER['CONTENT_LENGTH'] ?? 0);
+    }
 
     if ($contentLength > MAX_UPLOAD_BYTES) {
         s3Error('EntityTooLarge', 'Your proposed upload exceeds the maximum allowed size', 400);
@@ -446,28 +495,39 @@ function putObject(string $bucket, string $key): void
         s3Error('InternalError', 'Could not open file stream', 500);
     }
 
-    $bytes = 0;
+    if ($isAwsChunked) {
+        $bytes = readAwsChunkedBody($input, $output, MAX_UPLOAD_BYTES);
 
-    while (!feof($input)) {
-        $chunk = fread($input, 1024 * 1024);
-
-        if ($chunk === false) {
+        if ($contentLength > 0 && $bytes !== $contentLength) {
             fclose($input);
             fclose($output);
             @unlink($filePath);
-            s3Error('InternalError', 'Could not read input stream', 500);
+            s3Error('IncompleteBody', 'The actual uploaded size does not match the specified decoded content length', 400);
         }
+    } else {
+        $bytes = 0;
 
-        $bytes += strlen($chunk);
+        while (!feof($input)) {
+            $chunk = fread($input, 1024 * 1024);
 
-        if ($bytes > MAX_UPLOAD_BYTES) {
-            fclose($input);
-            fclose($output);
-            @unlink($filePath);
-            s3Error('EntityTooLarge', 'Your proposed upload exceeds the maximum allowed size', 400);
+            if ($chunk === false) {
+                fclose($input);
+                fclose($output);
+                @unlink($filePath);
+                s3Error('InternalError', 'Could not read input stream', 500);
+            }
+
+            $bytes += strlen($chunk);
+
+            if ($bytes > MAX_UPLOAD_BYTES) {
+                fclose($input);
+                fclose($output);
+                @unlink($filePath);
+                s3Error('EntityTooLarge', 'Your proposed upload exceeds the maximum allowed size', 400);
+            }
+
+            fwrite($output, $chunk);
         }
-
-        fwrite($output, $chunk);
     }
 
     fclose($input);
@@ -643,6 +703,360 @@ function deleteObject(string $bucket, string $key): void
     }
 
     http_response_code(204);
+}
+
+/*
+|--------------------------------------------------------------------------
+| Multipart upload operations
+|--------------------------------------------------------------------------
+*/
+
+function createMultipartUpload(string $bucket, string $key): void
+{
+    ensureBucketExists($bucket);
+
+    $uploadId = generateUploadId();
+    $partsPath = multipartPartsPath($uploadId);
+
+    if (!is_dir($partsPath) && !mkdir($partsPath, 0775, true)) {
+        s3Error('InternalError', 'Could not create multipart upload directory', 500);
+    }
+
+    $info = [
+        'bucket' => $bucket,
+        'key' => $key,
+        'contentType' => $_SERVER['CONTENT_TYPE'] ?? 'application/octet-stream',
+        'createdAt' => gmdate('Y-m-d\TH:i:s.000\Z'),
+        'parts' => (object)[],
+    ];
+
+    multipartSaveInfo($uploadId, $info);
+
+    debugLog('MULTIPART_INIT uploadId=' . $uploadId . ' bucket=' . $bucket . ' key=' . $key);
+
+    $body = xmlHeader()
+        . '<InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+        . '<Bucket>' . xmlEscape($bucket) . '</Bucket>'
+        . '<Key>' . xmlEscape($key) . '</Key>'
+        . '<UploadId>' . xmlEscape($uploadId) . '</UploadId>'
+        . '</InitiateMultipartUploadResult>';
+
+    while (ob_get_level() > 0) {
+        ob_end_clean();
+    }
+
+    http_response_code(200);
+    header('Content-Type: application/xml');
+    header('Content-Length: ' . strlen($body));
+    echo $body;
+    exit;
+}
+
+function uploadPart(string $bucket, string $key, string $uploadId, int $partNumber): void
+{
+    validateMultipartUploadId($uploadId);
+
+    $info = multipartInfo($uploadId);
+
+    if ($info['bucket'] !== $bucket || $info['key'] !== $key) {
+        s3Error('NoSuchUpload', 'The specified upload does not match the bucket and key', 404);
+    }
+
+    if ($partNumber < 1 || $partNumber > 10000) {
+        s3Error('InvalidArgument', 'Part number must be between 1 and 10000', 400);
+    }
+
+    $partsPath = multipartPartsPath($uploadId);
+    $partFile = $partsPath . '/' . sprintf('%05d', $partNumber);
+
+    $contentLength = (int)($_SERVER['CONTENT_LENGTH'] ?? 0);
+
+    if ($contentLength > MAX_UPLOAD_BYTES) {
+        s3Error('EntityTooLarge', 'Your proposed upload exceeds the maximum allowed size', 400);
+    }
+
+    $input = fopen('php://input', 'rb');
+    $output = fopen($partFile, 'wb');
+
+    if (!$input || !$output) {
+        s3Error('InternalError', 'Could not open file stream', 500);
+    }
+
+    $bytes = 0;
+
+    while (!feof($input)) {
+        $chunk = fread($input, 1024 * 1024);
+
+        if ($chunk === false) {
+            fclose($input);
+            fclose($output);
+            @unlink($partFile);
+            s3Error('InternalError', 'Could not read input stream', 500);
+        }
+
+        $bytes += strlen($chunk);
+
+        if ($bytes > MAX_UPLOAD_BYTES) {
+            fclose($input);
+            fclose($output);
+            @unlink($partFile);
+            s3Error('EntityTooLarge', 'Your proposed upload exceeds the maximum allowed size', 400);
+        }
+
+        if (fwrite($output, $chunk) === false) {
+            fclose($input);
+            fclose($output);
+            @unlink($partFile);
+            s3Error('InternalError', 'Could not write part data', 500);
+        }
+    }
+
+    fclose($input);
+    fclose($output);
+
+    $etag = md5_file($partFile);
+    $partKey = (string)$partNumber;
+
+    multipartUpdatePart($uploadId, $partKey, $bytes, $etag);
+
+    debugLog('MULTIPART_PART uploadId=' . $uploadId . ' part=' . $partNumber . ' bytes=' . $bytes . ' etag=' . $etag);
+
+    while (ob_get_level() > 0) {
+        ob_end_clean();
+    }
+
+    http_response_code(200);
+    header('ETag: "' . $etag . '"');
+    header('Content-Length: 0');
+    exit;
+}
+
+function completeMultipartUpload(string $bucket, string $key, string $uploadId): void
+{
+    validateMultipartUploadId($uploadId);
+
+    $info = multipartInfo($uploadId);
+
+    if ($info['bucket'] !== $bucket || $info['key'] !== $key) {
+        s3Error('NoSuchUpload', 'The specified upload does not match the bucket and key', 404);
+    }
+
+    ensureBucketExists($bucket);
+
+    $body = file_get_contents('php://input');
+
+    if ($body === false) {
+        s3Error('InternalError', 'Could not read complete request body', 500);
+    }
+
+    $submittedParts = parseCompleteMultipartXml($body);
+    $storedParts = (array)($info['parts'] ?? []);
+    $targetParts = [];
+    $prevPartNumber = 0;
+
+    foreach ($submittedParts as $submitted) {
+        $pn = $submitted['PartNumber'];
+        $submittedEtag = strtolower(trim($submitted['ETag'], '" '));
+
+        if ($pn <= $prevPartNumber) {
+            s3Error('InvalidPartOrder', 'The list of parts was not in ascending order', 400);
+        }
+
+        $prevPartNumber = $pn;
+        $pnStr = (string)$pn;
+
+        if (!isset($storedParts[$pnStr])) {
+            s3Error('InvalidPart', 'One or more of the specified parts could not be found', 400);
+        }
+
+        $storedEtag = strtolower($storedParts[$pnStr]['etag']);
+
+        if ($submittedEtag !== $storedEtag) {
+            s3Error('InvalidPart', 'One or more of the specified parts have an incorrect ETag', 400);
+        }
+
+        $targetParts[$pn] = $pnStr;
+    }
+
+    if (count($targetParts) === 0) {
+        abortMultipartUpload($bucket, $key, $uploadId);
+        s3Error('InvalidRequest', 'No parts specified in complete request', 400);
+    }
+
+    $filePath = objectPath($bucket, $key);
+    $dir = dirname($filePath);
+
+    if (!is_dir($dir) && !mkdir($dir, 0775, true)) {
+        s3Error('InternalError', 'Could not create object directory', 500);
+    }
+
+    $output = fopen($filePath, 'wb');
+
+    if (!$output) {
+        s3Error('InternalError', 'Could not create object file', 500);
+    }
+
+    $totalBytes = 0;
+    $partsPath = multipartPartsPath($uploadId);
+
+    foreach ($targetParts as $partKey) {
+        $partFile = $partsPath . '/' . sprintf('%05d', (int)$partKey);
+
+        if (!is_file($partFile)) {
+            fclose($output);
+            @unlink($filePath);
+            s3Error('InvalidPart', 'Part data not found on disk', 400);
+        }
+
+        $input = fopen($partFile, 'rb');
+
+        if (!$input) {
+            fclose($output);
+            @unlink($filePath);
+            s3Error('InternalError', 'Could not read part file', 500);
+        }
+
+        while (!feof($input)) {
+            $chunk = fread($input, 1024 * 1024);
+
+            if ($chunk === false) {
+                fclose($input);
+                fclose($output);
+                @unlink($filePath);
+                s3Error('InternalError', 'Could not read part data', 500);
+            }
+
+            $totalBytes += strlen($chunk);
+
+            if ($totalBytes > MAX_UPLOAD_BYTES) {
+                fclose($input);
+                fclose($output);
+                @unlink($filePath);
+                s3Error('EntityTooLarge', 'Your proposed upload exceeds the maximum allowed size', 400);
+            }
+
+            if (fwrite($output, $chunk) === false) {
+                fclose($input);
+                fclose($output);
+                @unlink($filePath);
+                s3Error('InternalError', 'Could not write object data', 500);
+            }
+        }
+
+        fclose($input);
+    }
+
+    fclose($output);
+
+    $etag = md5_file($filePath);
+    $lastModified = gmdate('Y-m-d\TH:i:s.000\Z', filemtime($filePath) ?: time());
+
+    cleanupMultipartDir($uploadId);
+
+    debugLog('MULTIPART_COMPLETE uploadId=' . $uploadId . ' bucket=' . $bucket . ' key=' . $key . ' bytes=' . $totalBytes . ' etag=' . $etag);
+
+    $body = xmlHeader()
+        . '<CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+        . '<Location>' . xmlEscape('/' . $bucket . '/' . $key) . '</Location>'
+        . '<Bucket>' . xmlEscape($bucket) . '</Bucket>'
+        . '<Key>' . xmlEscape($key) . '</Key>'
+        . '<ETag>"' . xmlEscape($etag) . '"</ETag>'
+        . '</CompleteMultipartUploadResult>';
+
+    while (ob_get_level() > 0) {
+        ob_end_clean();
+    }
+
+    http_response_code(200);
+    header('Content-Type: application/xml');
+    header('Content-Length: ' . strlen($body));
+    header('ETag: "' . $etag . '"');
+    echo $body;
+    exit;
+}
+
+function abortMultipartUpload(string $bucket, string $key, string $uploadId): void
+{
+    validateMultipartUploadId($uploadId);
+
+    $info = multipartInfo($uploadId);
+
+    if ($info['bucket'] !== $bucket || $info['key'] !== $key) {
+        s3Error('NoSuchUpload', 'The specified upload does not match the bucket and key', 404);
+    }
+
+    cleanupMultipartDir($uploadId);
+
+    debugLog('MULTIPART_ABORT uploadId=' . $uploadId . ' bucket=' . $bucket . ' key=' . $key);
+
+    http_response_code(204);
+    exit;
+}
+
+function listParts(string $bucket, string $key, string $uploadId, array $query): void
+{
+    validateMultipartUploadId($uploadId);
+
+    $info = multipartInfo($uploadId);
+
+    if ($info['bucket'] !== $bucket || $info['key'] !== $key) {
+        s3Error('NoSuchUpload', 'The specified upload does not match the bucket and key', 404);
+    }
+
+    $maxParts = max(1, min(1000, (int)($query['max-parts'] ?? 1000)));
+    $partNumberMarker = max(0, (int)($query['part-number-marker'] ?? 0));
+
+    $storedParts = (array)($info['parts'] ?? []);
+    ksort($storedParts, SORT_NUMERIC);
+
+    $filteredParts = [];
+
+    foreach ($storedParts as $partNum => $partData) {
+        if ((int)$partNum > $partNumberMarker) {
+            $filteredParts[$partNum] = $partData;
+        }
+    }
+
+    $partsSlice = array_slice($filteredParts, 0, $maxParts, true);
+    $isTruncated = count($partsSlice) < count($filteredParts);
+    $nextPartNumberMarker = '';
+
+    if ($isTruncated && count($partsSlice) > 0) {
+        $keys = array_keys($partsSlice);
+        $nextPartNumberMarker = (string)end($keys);
+    }
+
+    $result = xmlHeader()
+        . '<ListPartsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+        . '<Bucket>' . xmlEscape($bucket) . '</Bucket>'
+        . '<Key>' . xmlEscape($key) . '</Key>'
+        . '<UploadId>' . xmlEscape($uploadId) . '</UploadId>'
+        . '<StorageClass>STANDARD</StorageClass>'
+        . '<PartNumberMarker>' . $partNumberMarker . '</PartNumberMarker>'
+        . '<NextPartNumberMarker>' . xmlEscape($nextPartNumberMarker) . '</NextPartNumberMarker>'
+        . '<MaxParts>' . $maxParts . '</MaxParts>'
+        . '<IsTruncated>' . ($isTruncated ? 'true' : 'false') . '</IsTruncated>';
+
+    foreach ($partsSlice as $partNum => $partData) {
+        $result .= '<Part>'
+            . '<PartNumber>' . xmlEscape((string)$partNum) . '</PartNumber>'
+            . '<LastModified>' . xmlEscape($info['createdAt'] ?? gmdate('Y-m-d\TH:i:s.000\Z')) . '</LastModified>'
+            . '<ETag>"' . xmlEscape($partData['etag'] ?? '') . '"</ETag>'
+            . '<Size>' . (int)($partData['size'] ?? 0) . '</Size>'
+            . '</Part>';
+    }
+
+    $result .= '</ListPartsResult>';
+
+    while (ob_get_level() > 0) {
+        ob_end_clean();
+    }
+
+    http_response_code(200);
+    header('Content-Type: application/xml');
+    header('Content-Length: ' . strlen($result));
+    echo $result;
+    exit;
 }
 
 /*
@@ -1044,6 +1458,21 @@ function isAclQuery(array $query): bool
     return array_key_exists('acl', $query);
 }
 
+function isMultipartInitiateQuery(array $query): bool
+{
+    return array_key_exists('uploads', $query);
+}
+
+function isMultipartUploadPartQuery(array $query): bool
+{
+    return isset($query['partNumber'], $query['uploadId']);
+}
+
+function isMultipartManagementQuery(array $query): bool
+{
+    return isset($query['uploadId']) && !isset($query['partNumber']);
+}
+
 function isValidBucketName(string $bucket): bool
 {
     return (bool)preg_match('/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/', $bucket)
@@ -1083,6 +1512,237 @@ function cleanupEmptyDirs(string $dir, string $stopAt): void
         @rmdir($dir);
         $dir = dirname($dir);
     }
+}
+
+function generateUploadId(): string
+{
+    return bin2hex(random_bytes(16));
+}
+
+function multipartPath(string $uploadId): string
+{
+    return STORAGE_ROOT . '/.multipart/' . $uploadId;
+}
+
+function multipartPartsPath(string $uploadId): string
+{
+    return multipartPath($uploadId) . '/parts';
+}
+
+function multipartInfoPath(string $uploadId): string
+{
+    return multipartPath($uploadId) . '/info.json';
+}
+
+function multipartInfo(string $uploadId): array
+{
+    $infoPath = multipartInfoPath($uploadId);
+
+    if (!is_file($infoPath)) {
+        s3Error('NoSuchUpload', 'The specified upload does not exist', 404);
+    }
+
+    $json = @file_get_contents($infoPath);
+
+    if ($json === false || $json === '') {
+        s3Error('InternalError', 'Could not read multipart upload info', 500);
+    }
+
+    $data = json_decode($json, true);
+
+    if (!is_array($data) || !isset($data['bucket'], $data['key'])) {
+        s3Error('InternalError', 'Invalid multipart upload info', 500);
+    }
+
+    return $data;
+}
+
+function multipartSaveInfo(string $uploadId, array $data): void
+{
+    $infoPath = multipartInfoPath($uploadId);
+    $handle = @fopen($infoPath, 'wb');
+
+    if (!$handle) {
+        s3Error('InternalError', 'Could not create multipart upload info', 500);
+    }
+
+    if (!flock($handle, LOCK_EX)) {
+        fclose($handle);
+        s3Error('InternalError', 'Could not lock multipart upload info', 500);
+    }
+
+    fwrite($handle, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+    fflush($handle);
+    flock($handle, LOCK_UN);
+    fclose($handle);
+}
+
+function multipartUpdatePart(string $uploadId, string $partKey, int $bytes, string $etag): void
+{
+    $infoPath = multipartInfoPath($uploadId);
+    $handle = @fopen($infoPath, 'rb+');
+
+    if (!$handle) {
+        s3Error('InternalError', 'Could not open multipart upload info for update', 500);
+    }
+
+    if (!flock($handle, LOCK_EX)) {
+        fclose($handle);
+        s3Error('InternalError', 'Could not lock multipart upload info', 500);
+    }
+
+    $content = stream_get_contents($handle);
+
+    if ($content === false) {
+        flock($handle, LOCK_UN);
+        fclose($handle);
+        s3Error('InternalError', 'Could not read multipart upload info', 500);
+    }
+
+    $data = json_decode($content, true);
+
+    if (!is_array($data)) {
+        flock($handle, LOCK_UN);
+        fclose($handle);
+        s3Error('InternalError', 'Invalid multipart upload info', 500);
+    }
+
+    if (!isset($data['parts']) || !is_array($data['parts'])) {
+        $data['parts'] = [];
+    }
+
+    $data['parts'][$partKey] = [
+        'size' => $bytes,
+        'etag' => $etag,
+    ];
+
+    ftruncate($handle, 0);
+    rewind($handle);
+    fwrite($handle, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+    fflush($handle);
+    flock($handle, LOCK_UN);
+    fclose($handle);
+}
+
+function validateMultipartUploadId(string $uploadId): void
+{
+    if (!preg_match('/^[a-f0-9]{32}$/', $uploadId)) {
+        s3Error('InvalidArgument', 'Invalid upload id', 400);
+    }
+}
+
+function parseCompleteMultipartXml(string $xml): array
+{
+    if ($xml === '' || $xml === '0') {
+        s3Error('MalformedXML', 'The XML you provided was not well-formed', 400);
+    }
+
+    libxml_use_internal_errors(true);
+    $doc = @simplexml_load_string($xml);
+
+    if ($doc === false) {
+        $errors = libxml_get_errors();
+        libxml_clear_errors();
+        s3Error('MalformedXML', 'The XML you provided was not well-formed or does not match the schema', 400);
+    }
+
+    $parts = [];
+
+    foreach ($doc->Part as $part) {
+        $partNumber = (int)(string)$part->PartNumber;
+        $etag = (string)$part->ETag;
+
+        if ($partNumber < 1 || $partNumber > 10000 || $etag === '') {
+            s3Error('MalformedXML', 'The XML you provided was not well-formed or does not match the schema', 400);
+        }
+
+        $parts[] = [
+            'PartNumber' => $partNumber,
+            'ETag' => $etag,
+        ];
+    }
+
+    return $parts;
+}
+
+function cleanupMultipartDir(string $uploadId): void
+{
+    $path = multipartPath($uploadId);
+    recursiveDelete($path);
+}
+
+function recursiveDelete(string $dir): void
+{
+    if (!is_dir($dir)) {
+        return;
+    }
+
+    $items = array_diff(scandir($dir) ?: [], ['.', '..']);
+
+    foreach ($items as $item) {
+        $itemPath = $dir . '/' . $item;
+
+        if (is_dir($itemPath)) {
+            recursiveDelete($itemPath);
+        } else {
+            @unlink($itemPath);
+        }
+    }
+
+    @rmdir($dir);
+}
+
+function readAwsChunkedBody($input, $output, int $maxUploadBytes): int
+{
+    $totalBytes = 0;
+
+    while (true) {
+        $header = stream_get_line($input, 1024, "\n");
+        if ($header === false) {
+            break;
+        }
+        $header = rtrim($header, "\r");
+
+        $semicolonPos = strpos($header, ';');
+        $hexSize = $semicolonPos === false ? $header : substr($header, 0, $semicolonPos);
+        $chunkSize = hexdec($hexSize);
+
+        if ($chunkSize <= 0) {
+            break;
+        }
+
+        $remaining = $chunkSize;
+        while ($remaining > 0) {
+            $toRead = min(65536, $remaining);
+            $data = fread($input, $toRead);
+            if ($data === false || $data === '') {
+                s3Error('InternalError', 'Unexpected end of chunked stream', 500);
+            }
+            $len = strlen($data);
+            fwrite($output, $data);
+            $totalBytes += $len;
+            $remaining -= $len;
+
+            if ($totalBytes > $maxUploadBytes) {
+                s3Error('EntityTooLarge', 'Your proposed upload exceeds the maximum allowed size', 400);
+            }
+        }
+
+        $crlf = fread($input, 2);
+    }
+
+    while (true) {
+        $line = stream_get_line($input, 4096, "\n");
+        if ($line === false) {
+            break;
+        }
+        $line = rtrim($line, "\r");
+        if ($line === '') {
+            break;
+        }
+    }
+
+    return $totalBytes;
 }
 
 function getHeadersLower(): array
@@ -1132,7 +1792,7 @@ function getHeadersLower(): array
 function sendCommonHeaders(): void
 {
     header('Server: ' . SERVER_NAME);
-    header('Allow: GET, HEAD, PUT, DELETE, OPTIONS');
+    header('Allow: GET, HEAD, PUT, DELETE, POST, OPTIONS');
     header('x-amz-request-id: ' . bin2hex(random_bytes(8)));
     header('x-amz-id-2: ' . bin2hex(random_bytes(16)));
 }

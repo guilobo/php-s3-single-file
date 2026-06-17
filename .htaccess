@@ -11,7 +11,7 @@ SetEnvIf Authorization "(.*)" HTTP_AUTHORIZATION=$1
 RewriteCond %{HTTP:Authorization} ^(.+)
 RewriteRule .* - [E=HTTP_AUTHORIZATION:%1]
 
-# Block direct access to storage.
+# Block direct access to storage (including multipart metadata).
 RewriteRule ^storage(/.*)?$ - [F,L]
 
 # Block sensitive files.
@@ -27,8 +27,8 @@ RewriteCond %{REQUEST_URI} "\.svn" [NC,OR]
 RewriteCond %{REQUEST_URI} "\.hg" [NC]
 RewriteRule ^ - [F,L]
 
-# Allow only the basic methods used by this S3-compatible endpoint.
-<LimitExcept GET HEAD PUT DELETE OPTIONS>
+# Allow only the methods used by this S3-compatible endpoint (POST for multipart uploads).
+<LimitExcept GET HEAD PUT DELETE POST OPTIONS>
     Require all denied
 </LimitExcept>
 
@@ -47,7 +47,7 @@ LimitRequestBody 536870912
     Header always unset X-Powered-By
 
     Header always set Access-Control-Allow-Origin "*"
-    Header always set Access-Control-Allow-Methods "GET, HEAD, PUT, DELETE, OPTIONS"
+    Header always set Access-Control-Allow-Methods "GET, HEAD, PUT, DELETE, POST, OPTIONS"
     Header always set Access-Control-Allow-Headers "Authorization, Content-Type, Content-Length, Content-MD5, X-Amz-Date, X-Amz-Content-Sha256, X-Amz-Security-Token, X-Amz-Acl"
     Header always set Access-Control-Expose-Headers "ETag, x-amz-request-id, x-amz-id-2"
 </IfModule>
